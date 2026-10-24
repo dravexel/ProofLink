@@ -1,7 +1,7 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { config } from "./config.js";
+import { config, isSimulated, validateRealModeConfig } from "./config.js";
 import { relayerService } from "./relayer.js";
 
 export const app = new Hono();
@@ -28,7 +28,10 @@ app.use(
 );
 
 app.get("/", (c) => {
-  return c.json({ status: "ok", service: "prooflink-backend" });
+  return c.json({
+    status: "ok",
+    mode: isSimulated() ? "simulated" : "real",
+  });
 });
 
 // POST /api/requests: Start proof pipeline
@@ -80,6 +83,18 @@ const isTest =
   process.argv.some((a) => a.includes("test") || a.includes("e2e") || a.endsWith(".test.ts"));
 
 if (!isTest) {
+  const mode = isSimulated() ? "simulated" : "real";
+  console.log(`MODE: ${mode.toUpperCase()}`);
+
+  if (mode === "real") {
+    try {
+      validateRealModeConfig();
+    } catch (err: any) {
+      console.error(`FATAL STARTUP ERROR: ${err.message}`);
+      process.exit(1);
+    }
+  }
+
   console.log(`ProofLink Backend listening on port ${config.port}`);
   serve({
     fetch: app.fetch,

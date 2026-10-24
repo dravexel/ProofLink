@@ -1,3 +1,6 @@
+// Explicitly enable simulation mode for e2e testing without funded live wallets
+process.env.SIMULATE = "1";
+
 import { execSync } from "child_process";
 import path from "path";
 import { fileURLToPath } from "url";

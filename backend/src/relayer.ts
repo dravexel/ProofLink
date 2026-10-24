@@ -3,12 +3,11 @@ import {
   createWalletClient,
   http,
   parseAbi,
-  decodeFunctionData,
   keccak256,
   toHex,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { config } from "./config.js";
+import { config, isSimulated } from "./config.js";
 import { fetchProof, tamperProofNodes, MptProofResult } from "./proof.js";
 
 export type StepState = "pending" | "active" | "done" | "failed";
@@ -45,16 +44,20 @@ export class RelayerService {
   private requests = new Map<string, RequestRecord>();
 
   private sepoliaClient = createPublicClient({
-    transport: http(config.sepoliaRpc),
+    transport: http(config.sepoliaRpc || "https://ethereum-sepolia-rpc.publicnode.com"),
   });
 
   private amoyClient = createPublicClient({
-    transport: http(config.amoyRpc),
+    transport: http(config.amoyRpc || "https://rpc-amoy.polygon.technology"),
   });
 
   private getRelayerAccount() {
     if (config.relayerKey) {
-      return privateKeyToAccount(config.relayerKey);
+      try {
+        return privateKeyToAccount(config.relayerKey);
+      } catch {
+        return undefined;
+      }
     }
     return undefined;
   }
@@ -80,7 +83,7 @@ export class RelayerService {
     };
 
     this.requests.set(id, record);
-    // Start background processing
+    // Start background processing and track promise
     const p = this.processRequest(id).catch((err) => {
       console.error(`Error processing request ${id}:`, err);
     });
@@ -116,46 +119,60 @@ export class RelayerService {
     const record = this.requests.get(id);
     if (!record) return;
 
+    const sim = isSimulated();
+
+    // 1. SIMULATED MODE: Allowed only when SIMULATE=1
+    if (sim) {
+      this.updateStep(record, "sent", "done", { txHash: record.txHash });
+      record.blockNumber = 1000n;
+      record.sender = "0x1111111111111111111111111111111111111111" as `0x${string}`;
+      record.payloadHash = keccak256(toHex("unlock-demo-nft"));
+      record.stateRoot = keccak256(toHex("state-root-1000"));
+      this.updateStep(record, "root_synced", "done");
+
+      record.proof = {
+        accountProof: ["0x01" as `0x${string}`],
+        storageProof: ["0x01" as `0x${string}`],
+        storageHash: keccak256(toHex("storage-root")),
+        slot: keccak256(toHex("slot")),
+        value: 1000n,
+      };
+      this.updateStep(record, "proof_built", "done");
+      return;
+    }
+
+    // 2. REAL MODE: Never invent anything. Fail step with plain-language detail on error.
     try {
       // Step 1: Wait for Sepolia receipt
       this.updateStep(record, "sent", "active");
 
       let receipt;
       let tx;
-      const isTestEnv =
-        process.env.NODE_ENV === "test" ||
-        record.txHash.startsWith("0xab12") ||
-        record.txHash.startsWith("0xaa");
+      try {
+        receipt = await this.sepoliaClient.waitForTransactionReceipt({
+          hash: record.txHash,
+          timeout: 10_000,
+        });
+        tx = await this.sepoliaClient.getTransaction({ hash: record.txHash });
+      } catch (err: any) {
+        this.updateStep(record, "sent", "failed", {
+          detail: `Could not retrieve Sepolia transaction receipt: ${err.shortMessage || err.message}`,
+        });
+        return;
+      }
 
-      if (isTestEnv) {
-        receipt = {
-          blockNumber: 1000n,
-          from: "0x1111111111111111111111111111111111111111" as `0x${string}`,
-          to: config.emitterAddress,
-        };
-        tx = {
-          from: receipt.from,
-          input: "0x00" as `0x${string}`,
-        };
-      } else {
-        try {
-          receipt = await this.sepoliaClient.waitForTransactionReceipt({
-            hash: record.txHash,
-            timeout: 60_000,
-          });
-          tx = await this.sepoliaClient.getTransaction({ hash: record.txHash });
-        } catch (e: any) {
-          console.warn("Could not find tx on Sepolia, using fallback params:", e.message);
-          receipt = {
-            blockNumber: 1000n,
-            from: "0x1111111111111111111111111111111111111111" as `0x${string}`,
-            to: config.emitterAddress,
-          };
-          tx = {
-            from: receipt.from,
-            input: "0x00" as `0x${string}`,
-          };
-        }
+      if (!receipt || !tx) {
+        this.updateStep(record, "sent", "failed", {
+          detail: "Transaction receipt or transaction data not found on Sepolia.",
+        });
+        return;
+      }
+
+      if (receipt.status === "reverted") {
+        this.updateStep(record, "sent", "failed", {
+          detail: "Transaction reverted on Sepolia.",
+        });
+        return;
       }
 
       record.blockNumber = receipt.blockNumber;
@@ -165,7 +182,10 @@ export class RelayerService {
       if (tx.input && tx.input.length >= 74) {
         record.payloadHash = ("0x" + tx.input.slice(10, 74)) as `0x${string}`;
       } else {
-        record.payloadHash = keccak256(toHex("unlock-demo-nft"));
+        this.updateStep(record, "sent", "failed", {
+          detail: "Transaction input does not match send(bytes32) format.",
+        });
+        return;
       }
 
       this.updateStep(record, "sent", "done", { txHash: record.txHash });
@@ -176,31 +196,48 @@ export class RelayerService {
       let stateRoot: `0x${string}`;
       try {
         const block = await this.sepoliaClient.getBlock({ blockNumber: record.blockNumber });
-        stateRoot = block.stateRoot as `0x${string}`;
-      } catch {
-        stateRoot = keccak256(toHex(`state-root-${record.blockNumber}`));
-      }
-      record.stateRoot = stateRoot;
-
-      // Sync root to CheckpointLightClient on Amoy if relayer key is available
-      const relayerAccount = this.getRelayerAccount();
-      if (relayerAccount && config.lightClientAddress !== "0x0000000000000000000000000000000000000000") {
-        try {
-          const wallet = createWalletClient({
-            account: relayerAccount,
-            transport: http(config.amoyRpc),
-          });
-          const lcAbi = parseAbi(["function setStateRoot(uint256,bytes32)"]);
-          const syncTx = await wallet.writeContract({
-            address: config.lightClientAddress,
-            abi: lcAbi,
-            functionName: "setStateRoot",
-            args: [record.blockNumber, stateRoot],
-          });
-          await this.amoyClient.waitForTransactionReceipt({ hash: syncTx });
-        } catch (e: any) {
-          console.warn("Relayer sync root transaction failed:", e.message);
+        if (!block || !block.stateRoot) {
+          throw new Error("Block or stateRoot unavailable");
         }
+        stateRoot = block.stateRoot as `0x${string}`;
+        record.stateRoot = stateRoot;
+      } catch (err: any) {
+        this.updateStep(record, "root_synced", "failed", {
+          detail: `Failed to fetch Sepolia state root for block ${record.blockNumber}: ${err.shortMessage || err.message}`,
+        });
+        return;
+      }
+
+      // Sync root to CheckpointLightClient on Amoy
+      const relayerAccount = this.getRelayerAccount();
+      if (!relayerAccount) {
+        this.updateStep(record, "root_synced", "failed", {
+          detail: "RELAYER_KEY is missing or invalid; cannot post state root to Amoy.",
+        });
+        return;
+      }
+
+      try {
+        const wallet = createWalletClient({
+          account: relayerAccount,
+          transport: http(config.amoyRpc),
+        });
+        const lcAbi = parseAbi(["function setStateRoot(uint256,bytes32)"]);
+        const syncTx = await wallet.writeContract({
+          address: config.lightClientAddress,
+          abi: lcAbi,
+          functionName: "setStateRoot",
+          args: [record.blockNumber, stateRoot],
+        });
+        const syncReceipt = await this.amoyClient.waitForTransactionReceipt({ hash: syncTx });
+        if (syncReceipt.status === "reverted") {
+          throw new Error("setStateRoot transaction reverted on Polygon Amoy");
+        }
+      } catch (err: any) {
+        this.updateStep(record, "root_synced", "failed", {
+          detail: `Failed to post state root to Amoy light client: ${err.shortMessage || err.message}`,
+        });
+        return;
       }
 
       this.updateStep(record, "root_synced", "done");
@@ -209,33 +246,19 @@ export class RelayerService {
       this.updateStep(record, "proof_built", "active");
 
       let proof: MptProofResult;
-      if (isTestEnv) {
-        proof = {
-          accountProof: ["0x01" as `0x${string}`],
-          storageProof: ["0x01" as `0x${string}`],
-          storageHash: keccak256(toHex("storage-root")),
-          slot: keccak256(toHex("slot")),
-          value: record.blockNumber!,
-        };
-      } else {
-        try {
-          proof = await fetchProof(
-            config.sepoliaRpc,
-            config.emitterAddress,
-            record.sender!,
-            record.payloadHash!,
-            record.blockNumber!
-          );
-        } catch (e: any) {
-          console.warn("Proof fetching from RPC failed, using generated proof:", e.message);
-          proof = {
-            accountProof: ["0x01" as `0x${string}`],
-            storageProof: ["0x01" as `0x${string}`],
-            storageHash: keccak256(toHex("storage-root")),
-            slot: keccak256(toHex("slot")),
-            value: record.blockNumber!,
-          };
-        }
+      try {
+        proof = await fetchProof(
+          config.sepoliaRpc,
+          config.emitterAddress,
+          record.sender!,
+          record.payloadHash!,
+          record.blockNumber!
+        );
+      } catch (err: any) {
+        this.updateStep(record, "proof_built", "failed", {
+          detail: `Failed to build Merkle proof via eth_getProof: ${err.shortMessage || err.message}`,
+        });
+        return;
       }
 
       record.proof = proof;
@@ -258,59 +281,81 @@ export class RelayerService {
 
     this.updateStep(record, "verified", "active");
 
-    const relayerAccount = this.getRelayerAccount();
-    const verifierAbi = parseAbi([
-      "function verify(bytes[],bytes[],uint256,address,bytes32)",
-    ]);
+    const sim = isSimulated();
 
-    if (relayerAccount && config.verifierAddress !== "0x0000000000000000000000000000000000000000" && record.proof) {
-      try {
-        const wallet = createWalletClient({
-          account: relayerAccount,
-          transport: http(config.amoyRpc),
-        });
-
-        const storageProof = tamper
-          ? tamperProofNodes(record.proof.storageProof)
-          : record.proof.storageProof;
-
-        const tx = await wallet.writeContract({
-          address: config.verifierAddress,
-          abi: verifierAbi,
-          functionName: "verify",
-          args: [
-            record.proof.accountProof,
-            storageProof,
-            record.blockNumber!,
-            record.sender!,
-            record.payloadHash!,
-          ],
-        });
-
-        await this.amoyClient.waitForTransactionReceipt({ hash: tx });
-        this.updateStep(record, "verified", "done", { txHash: tx });
-        return;
-      } catch (err: any) {
-        console.error("On-chain verify error:", err);
-        const reason = err.shortMessage || err.message || "InvalidProof()";
+    // 1. SIMULATED MODE: Allowed only when SIMULATE=1
+    if (sim) {
+      if (tamper) {
         this.updateStep(record, "verified", "failed", {
-          detail: `Verifier reverted with ${reason}. The proof does not match the trusted state root.`,
+          detail:
+            "Verifier reverted with InvalidProof(). The proof does not match the trusted state root.",
         });
         return;
       }
+      const mockAmoyTx = ("0x" + Array.from({ length: 64 }, () => Math.floor(Math.random() * 16).toString(16)).join("")) as `0x${string}`;
+      this.updateStep(record, "verified", "done", { txHash: mockAmoyTx });
+      return;
     }
 
-    if (tamper) {
+    // 2. REAL MODE: Never invent anything
+    const relayerAccount = this.getRelayerAccount();
+    if (!relayerAccount) {
       this.updateStep(record, "verified", "failed", {
-        detail:
-          "Verifier reverted with InvalidProof(). The proof does not match the trusted state root.",
+        detail: "RELAYER_KEY is not configured; cannot submit verification on Amoy.",
       });
       return;
     }
 
-    // Default success for simulation or test environment
-    const mockAmoyTx = ("0x" + Array.from({ length: 64 }, () => Math.floor(Math.random() * 16).toString(16)).join("")) as `0x${string}`;
-    this.updateStep(record, "verified", "done", { txHash: mockAmoyTx });
+    if (!record.proof) {
+      this.updateStep(record, "verified", "failed", {
+        detail: "Proof is missing; cannot verify on Amoy.",
+      });
+      return;
+    }
+
+    const verifierAbi = parseAbi([
+      "function verify(bytes[],bytes[],uint256,address,bytes32)",
+    ]);
+
+    try {
+      const wallet = createWalletClient({
+        account: relayerAccount,
+        transport: http(config.amoyRpc),
+      });
+
+      const storageProof = tamper
+        ? tamperProofNodes(record.proof.storageProof)
+        : record.proof.storageProof;
+
+      const tx = await wallet.writeContract({
+        address: config.verifierAddress,
+        abi: verifierAbi,
+        functionName: "verify",
+        args: [
+          record.proof.accountProof,
+          storageProof,
+          record.blockNumber!,
+          record.sender!,
+          record.payloadHash!,
+        ],
+      });
+
+      const receipt = await this.amoyClient.waitForTransactionReceipt({ hash: tx });
+      if (receipt.status === "reverted") {
+        this.updateStep(record, "verified", "failed", {
+          detail: "Verifier reverted with InvalidProof(). The proof does not match the trusted state root.",
+        });
+        return;
+      }
+
+      this.updateStep(record, "verified", "done", { txHash: tx });
+    } catch (err: any) {
+      console.error("On-chain verify error:", err);
+      const reason = err.shortMessage || err.message || "InvalidProof()";
+      this.updateStep(record, "verified", "failed", {
+        detail: `Verifier reverted with ${reason}. The proof does not match the trusted state root.`,
+      });
+    }
   }
 }
 
