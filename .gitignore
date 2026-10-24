@@ -1,6 +1,9 @@
-<<<<<<< HEAD
-node_modules
-=======
-node_modules/ 
-.env 
->>>>>>> 65ffac9b (Remove node_modules from version control)
+node_modules/
+.next/
+dist/
+cache/
+out/
+.env
+.env.*
+!.env.example
+!.env.local

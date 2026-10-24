@@ -1,0 +1,71 @@
+import dotenv from "dotenv";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Load .env from backend or root
+const rootEnvPath = path.resolve(__dirname, "../../.env");
+const backendEnvPath = path.resolve(__dirname, "../.env");
+
+if (fs.existsSync(backendEnvPath)) {
+  dotenv.config({ path: backendEnvPath });
+} else if (fs.existsSync(rootEnvPath)) {
+  dotenv.config({ path: rootEnvPath });
+} else {
+  dotenv.config();
+}
+
+export interface Deployments {
+  sepolia?: {
+    emitter?: `0x${string}`;
+  };
+  amoy?: {
+    lightClient?: `0x${string}`;
+    verifier?: `0x${string}`;
+    gatedNft?: `0x${string}`;
+  };
+}
+
+export function loadDeployments(): Deployments {
+  const deploymentsPath = path.resolve(__dirname, "../../deployments.json");
+  if (fs.existsSync(deploymentsPath)) {
+    try {
+      return JSON.parse(fs.readFileSync(deploymentsPath, "utf-8"));
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+const deployments = loadDeployments();
+
+export const config = {
+  port: Number(process.env.PORT || 4000),
+  sepoliaRpc: process.env.SEPOLIA_RPC || "https://ethereum-sepolia-rpc.publicnode.com",
+  amoyRpc: process.env.AMOY_RPC || "https://rpc-amoy.polygon.technology",
+  deployerKey: (process.env.DEPLOYER_KEY?.startsWith("0x")
+    ? process.env.DEPLOYER_KEY
+    : process.env.DEPLOYER_KEY
+    ? `0x${process.env.DEPLOYER_KEY}`
+    : undefined) as `0x${string}` | undefined,
+  relayerKey: (process.env.RELAYER_KEY?.startsWith("0x")
+    ? process.env.RELAYER_KEY
+    : process.env.RELAYER_KEY
+    ? `0x${process.env.RELAYER_KEY}`
+    : undefined) as `0x${string}` | undefined,
+  emitterAddress: (process.env.EMITTER_ADDRESS ||
+    deployments.sepolia?.emitter ||
+    "0x0000000000000000000000000000000000000000") as `0x${string}`,
+  lightClientAddress: (process.env.LIGHT_CLIENT_ADDRESS ||
+    deployments.amoy?.lightClient ||
+    "0x0000000000000000000000000000000000000000") as `0x${string}`,
+  verifierAddress: (process.env.VERIFIER_ADDRESS ||
+    deployments.amoy?.verifier ||
+    "0x0000000000000000000000000000000000000000") as `0x${string}`,
+  nftAddress: (process.env.NFT_ADDRESS ||
+    deployments.amoy?.gatedNft ||
+    "0x0000000000000000000000000000000000000000") as `0x${string}`,
+};
