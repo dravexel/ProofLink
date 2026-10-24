@@ -1,0 +1,3 @@
+@tailwind base;@tailwind components;@tailwind utilities;
+body{background:#E8EEF2;color:#14213D}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}

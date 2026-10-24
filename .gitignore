@@ -1,0 +1,6 @@
+<<<<<<< HEAD
+node_modules
+=======
+node_modules/ 
+.env 
+>>>>>>> 65ffac9b (Remove node_modules from version control)
