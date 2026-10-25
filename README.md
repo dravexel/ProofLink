@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-  <a href="https://proof-link-iota.vercel.app">Live demo UI</a> ·
+  <a href="https://team-genesis-rohan-tarke.vercel.app/">Live demo UI</a> ·
   <a href="#-the-problem">Problem</a> ·
   <a href="#-how-it-works">How it works</a> ·
   <a href="#-architecture">Architecture</a> ·
@@ -41,7 +41,7 @@
 | Frontend (Next.js) | Built and deployed on Vercel |
 | Live Sepolia → Amoy run with deployed contracts | **Next milestone.** Code paths exist; deployment needs funded testnet wallets |
 
-The hosted UI at [proof-link-iota.vercel.app](https://proof-link-iota.vercel.app) runs in **demo mode** (`NEXT_PUBLIC_MOCK=1`), which does not talk to a chain. The contract verification logic is what is tested on real proof data.
+The hosted UI at [proof-link-iota.vercel.app](https://team-genesis-rohan-tarke.vercel.app/) runs in **demo mode** (`NEXT_PUBLIC_MOCK=1`), which does not talk to a chain. The contract verification logic is what is tested on real proof data.
 
 ## 🚨 The problem
 
